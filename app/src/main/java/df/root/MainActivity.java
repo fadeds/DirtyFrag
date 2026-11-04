@@ -220,7 +220,9 @@ public class MainActivity extends Activity implements IReporter {
             }
         }
         // Run bar finishes here - the module is in, nothing left to patch.
-        if (t.startsWith("libc++: loading custom module")) {
+        // The payload host is whichever library had room (exp.c kHookSites), so
+        // the marker no longer names libc++.
+        if (t.startsWith("payload: loading custom module")) {
             setSeg1(1f);
         }
         // Verification bar: one step per bootstrap marker (see exp.c markers[]).

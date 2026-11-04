@@ -43,3 +43,6 @@ app/src/main/jni/ko/*.ko
 # the standalone adb build of the vault harness (df.d2.Harness)
 /d2/dist/
 __pycache__/
+
+# WorkBuddy workspace state (project memory/notes)
+.workbuddy/

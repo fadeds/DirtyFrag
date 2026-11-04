@@ -123,9 +123,10 @@ The Android kernel decrypts AES-CBC ESP packets directly into the page cache of 
 16-byte-aligned block in a mapped shared library can be overwritten without write permission and
 without copy-on-write.
 
-The exploit uses this primitive to patch shellcode into `libc++.so` in the kernel's page cache. The
-next privileged call to the hooked function runs the shellcode, which loads the kernel module via
-`insmod`.
+The exploit uses this primitive to patch shellcode into a system library in the kernel's page cache -
+`libc++.so` first, then `liblog.so` or `libbase.so` if that one has nowhere left to put the blob, and a
+cold exported function if a library has no padding either. The next privileged call to the hooked
+function runs the shellcode, which loads the kernel module via `insmod`.
 
 ### Exploit chain
 
@@ -136,9 +137,10 @@ next privileged call to the hooked function runs the shellcode, which loads the 
    labelled files that `untrusted_app` cannot read - the bridge we need.
 3. **dfroot.ko -> vendor_file** - the kernel module is written through that bridge into a
    `vendor_file`-labelled file.
-4. **libc++ hook** (fires in init, uid=0, tid=1) - shellcode patched at
-   `std::ostream::sentry::sentry()`. It checks uid and tid, creates `/dev/df` as a one-shot mutex so
-   it cannot re-enter, then execs `insmod` in the `vendor_modprobe` domain.
+4. **payload hook** (fires in init, uid=0, tid=1) - shellcode patched over
+   `std::ostream::sentry::sentry()`, or over `__android_log_write` when `libc++.so` has no room. It
+   checks uid and tid, creates `/dev/df` as a one-shot mutex so it cannot re-enter, then execs
+   `insmod` in the `vendor_modprobe` domain.
 5. **dfroot.ko init** - sets SELinux permissive, bypasses DEFEX via kprobes where present, then uses
    `call_usermodehelper` to run the bootstrap.
 6. **bootstrap** - reads the app's device-protected settings, adopts the zygote environment, sets
