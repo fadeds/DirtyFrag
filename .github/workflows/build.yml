@@ -75,21 +75,43 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # setup-java has to come first: the ephemeral-keystore step below needs
+      # keytool on PATH, and build.gradle.kts needs a JDK for Gradle itself.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # Only a tag run publishes a Release, so only a tag run needs the real
+      # signing key. Push / manual / PR runs are test builds: generate the
+      # keystore on the runner with the same recipe the README documents, so a
+      # fresh fork can produce an installable APK without configuring any
+      # secret. Those APKs carry a throwaway key - they cannot be installed as
+      # an update over a release-signed build, so uninstall first when swapping.
       - name: Validate signing config
-        if: github.event_name != 'pull_request'
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           if [ "${{ secrets.KEYSTORE }}" = "" ]; then
-            echo "::error::Signing secrets not configured. KEYSTORE secret is required for release builds."
+            echo "::error::Signing secrets not configured. KEYSTORE secret is required for tagged releases."
             exit 1
           fi
 
-      - name: Create keystore
-        if: github.event_name != 'pull_request'
+      - name: Create keystore from secret
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           # app/build.gradle.kts signs with app/keystore.jks (gitignored; the README
           # documents how to generate it), so the KEYSTORE secret has to be decoded
           # into app/, not into the repo root the upstream workflow used.
           echo ${{ secrets.KEYSTORE }} | base64 --decode > app/keystore.jks
+          ls -l app/keystore.jks
+
+      - name: Create ephemeral keystore for test builds
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          keytool -genkeypair -v -keystore app/keystore.jks -alias dirtyfrag \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass dirtyfrag -keypass dirtyfrag \
+            -dname "CN=DirtyFrag CI, OU=CI, O=DirtyFrag, L=Unknown, ST=Unknown, C=US"
           ls -l app/keystore.jks
 
       - name: Download DF LKMs
@@ -98,11 +120,6 @@ jobs:
           pattern: df-lkm-*
           merge-multiple: true
           path: app/src/main/jni/ko/
-
-      - uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: 21
 
       - uses: gradle/actions/setup-gradle@v6
 
